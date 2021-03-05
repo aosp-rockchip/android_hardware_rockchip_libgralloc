@@ -1609,10 +1609,112 @@ static bool is_no_afbc_for_fb_target_layer_required_via_prop()
 	return (0 == strcmp("1", value) );
 }
 
-static uint64_t rk_gralloc_select_format(const uint64_t req_format,
-					 const uint64_t usage)
+#define PROP_NAME_OF_FB_SIZE	"vendor.gralloc.fb_size"
+
+/* framebuffer resolution (w x h, in pixels). */
+static int s_fb_size;
+
+/*
+ * 跨进程地, 全局地保存 fb_size.
+ *
+ * 除了 android.hardware.graphics.allocator@4.0-service 进程实现的 allocate buffer 的流程外,
+ * app 进程中, mapper 的某个接口的实现中, 也会调用到 rk_gralloc_select_format().
+ * rk_gralloc_select_format() 的行为 依赖 fb_size.
+ * 也即, fb_size 必须被 跨进程地, 全局地保存.
+ */
+void save_fb_size(int fb_size)
 {
-	GRALLOC_UNUSED(usage);
+	char fb_size_in_str[PROPERTY_VALUE_MAX];
+
+	if ( s_fb_size != 0 )
+	{
+		return;
+	}
+
+	s_fb_size = fb_size;
+
+	sprintf(fb_size_in_str, "%d", fb_size);
+	property_set(PROP_NAME_OF_FB_SIZE, fb_size_in_str);
+}
+
+int get_fb_size(void)
+{
+	char fb_size_in_str[PROPERTY_VALUE_MAX];
+
+	if ( s_fb_size != 0 )
+	{
+		return s_fb_size;
+	}
+
+	property_get(PROP_NAME_OF_FB_SIZE, fb_size_in_str, "0");
+	s_fb_size = atoi(fb_size_in_str);
+
+	return s_fb_size;
+}
+
+static bool is_not_to_use_non_afbc_for_small_buffers_required_via_prop()
+{
+	char value[PROPERTY_VALUE_MAX];
+
+	property_get("vendor.gralloc.not_to_use_non_afbc_for_small_buffers", value, "0");
+
+	return (0 == strcmp("1", value) );
+}
+
+/*
+ * 从 size 角度判断 当前 buffer_of_fb_target_layer 是否 应该使用 AFBC.
+ *
+ * 用于配合 HWC 的合成策略的实现,
+ * 具体判断逻辑 来自 邮件列表 "要求Gralloc针对GraphicBuffer-Size动态开关AFBCD编码标识".
+ * 基本的行为是对 size 较小的 buffer 不使用 AFBC 格式, 记为 use_non_afbc_for_small_buffers.
+ *
+ * 预期 本函数 只会在 rk356x 运行时被调用.
+ */
+static bool should_sf_client_layer_use_afbc_format_by_size(const uint64_t base_format, const int buffer_size)
+{
+	int fb_size = get_fb_size();
+
+        /* 若格式 "不是" rgba_8888, 则 */
+        if ( MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888 != base_format )
+        {
+                /* 将使用 AFBC 格式, 即 不参与 use_non_afbc_for_small_buffers. */
+                return true;
+        }
+        // 至此, base_format 都是 MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
+
+	/* 若外部 "有" '通过属性要求 对 sf_client_layer "不" 使用 AFBC 格式', 则... */
+        if ( is_no_afbc_for_sf_client_layer_required_via_prop() )
+        {
+                /* 将 "不" 使用 AFBC .*/
+                return false;
+        }
+
+	/* 若有 属性要求 禁用 use_non_afbc_for_small_buffers , 则... */
+	if ( is_not_to_use_non_afbc_for_small_buffers_required_via_prop() )
+	{
+		D("SHOULD use AFBC: use_non_afbc_for_small_buffers is disabled via prop.");
+		/* 预期使用 AFBC 格式. */
+		return true;
+	}
+
+	/* 若 当前 buffer 足够 "小", 则... */
+	if ( buffer_size < (fb_size / 4) )
+	{
+		D("should NOT to use AFBC: buffer_size : %d, fb_size : %d", buffer_size, fb_size);
+		/* 预期 "不" 使用 AFBC 格式. */
+		return false;
+	}
+	else
+	{
+		D("SHOULD use AFBC: buffer_size : %d, fb_size : %d", buffer_size, fb_size);
+		return true;
+	}
+}
+
+static uint64_t rk_gralloc_select_format(const uint64_t req_format,
+					 const uint64_t usage,
+					 const int buffer_size) // Buffer resolution (w x h, in pixels).
+{
 	uint64_t internal_format = req_format;
 
 	/*-------------------------------------------------------*/
@@ -1710,7 +1812,6 @@ static uint64_t rk_gralloc_select_format(const uint64_t req_format,
 					MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
 					| MALI_GRALLOC_INTFMT_AFBC_BASIC
 					| MALI_GRALLOC_INTFMT_AFBC_YUV_TRANSFORM;
-
 				break;
 
 			case RK356X:
@@ -1733,53 +1834,50 @@ static uint64_t rk_gralloc_select_format(const uint64_t req_format,
 			internal_format = req_format;
 		}
 
+		save_fb_size(buffer_size);
+
 		return internal_format;
 	}
 	/* 否则, 即 当前 buffer 用于 sf_client_layer, 则... */
 	else
 	{
-		/* 若 "没有" '通过属性要求 对 sf_client_layer "不" 使用 AFBC 格式', 即可以使用 AFBC 格式, 则... */
-		if ( !is_no_afbc_for_sf_client_layer_required_via_prop() )
-		{
-			/* 若 client "没有" 在 'usage' 显式要求 "不" 使用 AFBC, 则 ... */
-			if ( 0 == (usage & MALI_GRALLOC_USAGE_NO_AFBC) )
-			{
-				/* 若当前 platform 是 356x, 则... */
-				if ( RK356X == get_rk_board_platform() )
-				{
-					/* 尽可能对 buffers of sf_client_layer 使用 AFBC 格式. */
+                /* 若 client "没有" 在 'usage' 显式要求 "不" 使用 AFBC, 则 ... */
+                if ( 0 == (usage & MALI_GRALLOC_USAGE_NO_AFBC) )
+                {
+                        /* 若当前 platform 是 356x, 则... */
+                        if ( RK356X == get_rk_board_platform() )
+                        {
+                                /* 尽可能对 buffers of sf_client_layer 使用 AFBC 格式. */
 
-					/* 若 CPU "不会" 读写 buffer,
-					 * 且 VPU "不会" 读 buffer (to encode),
-					 * 且 camera "不会" 读写 buffer,
-					 * 则... */
-					if ( 0 == (usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK) )
-							&& 0 == (usage & GRALLOC_USAGE_HW_VIDEO_ENCODER)
-							&& 0 == (usage & GRALLOC_USAGE_HW_CAMERA_WRITE)
-							&& 0 == (usage & GRALLOC_USAGE_HW_CAMERA_READ) )
-					{
-						/* 若 internal_format 不是 nv12,
-						   且 不是 MALI_GRALLOC_FORMAT_INTERNAL_P010,
-						   且 不是 MALI_GRALLOC_FORMAT_INTERNAL_NV16,
-						   则... */
-						if ( internal_format != MALI_GRALLOC_FORMAT_INTERNAL_NV12
-							&& internal_format != MALI_GRALLOC_FORMAT_INTERNAL_P010
-							&& internal_format != MALI_GRALLOC_FORMAT_INTERNAL_RGBA_16161616
-							&& internal_format != MALI_GRALLOC_FORMAT_INTERNAL_NV16 )
-						{
-							/* 强制将 'internal_format' 设置为对应的 AFBC 格式. */
-							internal_format = internal_format | MALI_GRALLOC_INTFMT_AFBC_BASIC;
-							D("use_afbc_layer: force to set 'internal_format' to 0x%" PRIx64 " for usage '0x%" PRIx64,
-									internal_format, usage);
-						}
-					}
-				}
-			}
-		}
-		else	// if ( !is_no_afbc_for_sf_client_layer_required_via_prop() )
-		{
-			I("no_afbc_for_sf_client_layer is requested via prop");
-		}
+                                /* 若 CPU "不会" 读写 buffer,
+                                 * 且 VPU "不会" 读 buffer (to encode),
+                                 * 且 camera "不会" 读写 buffer,
+                                 * 则... */
+                                if ( 0 == (usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK) )
+                                                && 0 == (usage & GRALLOC_USAGE_HW_VIDEO_ENCODER)
+                                                && 0 == (usage & GRALLOC_USAGE_HW_CAMERA_WRITE)
+                                                && 0 == (usage & GRALLOC_USAGE_HW_CAMERA_READ) )
+                                {
+                                        /* 若 internal_format 不是 nv12,
+                                           且 不是 MALI_GRALLOC_FORMAT_INTERNAL_P010,
+                                           且 不是 MALI_GRALLOC_FORMAT_INTERNAL_NV16,
+                                           且 根据 size 判断 当前的 buffer_of_sf_client_layer 应该 使用 AFBC 格式,
+                                           则... */
+                                        if ( internal_format != MALI_GRALLOC_FORMAT_INTERNAL_NV12
+                                                && internal_format != MALI_GRALLOC_FORMAT_INTERNAL_P010
+                                                && internal_format != MALI_GRALLOC_FORMAT_INTERNAL_RGBA_16161616
+                                                && internal_format != MALI_GRALLOC_FORMAT_INTERNAL_NV16
+                                                && should_sf_client_layer_use_afbc_format_by_size(internal_format,
+                                                                                                  buffer_size) )
+                                        {
+                                                /* 强制将 'internal_format' 设置为对应的 AFBC 格式. */
+                                                internal_format = internal_format | MALI_GRALLOC_INTFMT_AFBC_BASIC;
+                                                D("use_afbc_layer: force to set 'internal_format' to 0x%" PRIx64 " for usage '0x%" PRIx64,
+                                                                internal_format, usage);
+                                        }
+                                }
+                        }
+                }
 	}
 
 	/*-------------------------------------------------------*/
@@ -1814,7 +1912,7 @@ uint64_t mali_gralloc_select_format(const uint64_t req_format,
 	GRALLOC_UNUSED(buffer_size);
 	uint64_t alloc_format;
 
-	*internal_format = rk_gralloc_select_format(req_format, usage);
+	*internal_format = rk_gralloc_select_format(req_format, usage, buffer_size);
 
 	alloc_format = *internal_format;
 
