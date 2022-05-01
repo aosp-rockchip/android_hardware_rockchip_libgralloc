@@ -1611,6 +1611,7 @@ static bool is_no_afbc_for_fb_target_layer_required_via_prop()
 
 #define PROP_NAME_OF_FB_SIZE	"vendor.gralloc.fb_size"
 
+static int get_fb_size(void);
 /* framebuffer resolution (w x h, in pixels). */
 static int s_fb_size;
 
@@ -1622,14 +1623,14 @@ static int s_fb_size;
  * rk_gralloc_select_format() 的行为 依赖 fb_size.
  * 也即, fb_size 必须被 跨进程地, 全局地保存.
  */
-void save_fb_size(int fb_size)
+static void save_fb_size(int fb_size)
 {
 	char fb_size_in_str[PROPERTY_VALUE_MAX];
 
-	if ( s_fb_size != 0 )
-	{
-		return;
-	}
+        if ( get_fb_size() != 0 )
+        {
+	        return;
+        }
 
 	s_fb_size = fb_size;
 
@@ -1637,7 +1638,7 @@ void save_fb_size(int fb_size)
 	property_set(PROP_NAME_OF_FB_SIZE, fb_size_in_str);
 }
 
-int get_fb_size(void)
+static int get_fb_size(void)
 {
 	char fb_size_in_str[PROPERTY_VALUE_MAX];
 
@@ -1681,13 +1682,6 @@ static bool should_sf_client_layer_use_afbc_format_by_size(const uint64_t base_f
                 return true;
         }
         // 至此, base_format 都是 MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
-
-	/* 若外部 "有" '通过属性要求 对 sf_client_layer "不" 使用 AFBC 格式', 则... */
-        if ( is_no_afbc_for_sf_client_layer_required_via_prop() )
-        {
-                /* 将 "不" 使用 AFBC .*/
-                return false;
-        }
 
 	/* 若有 属性要求 禁用 use_non_afbc_for_small_buffers , 则... */
 	if ( is_not_to_use_non_afbc_for_small_buffers_required_via_prop() )
@@ -1803,30 +1797,61 @@ static uint64_t rk_gralloc_select_format(const uint64_t req_format,
 	{
 		if ( !is_no_afbc_for_fb_target_layer_required_via_prop() )
 		{
-			rk_board_platform_t platform = get_rk_board_platform();
-			switch ( platform )
+			/* 若当前 buffer_of_fb_target_layer 还将被送入 video_decoder,
+			 *	或 被显式要求禁用 AFBC,
+			 *	或 会被 CPU 一侧读写,
+			 *	或 会被 camera 读写,
+			 *	或 'internal_format' 是 若干特定格式,
+			 * 则, 将不使用 AFBC 格式.
+			 */
+			if ( (GRALLOC_USAGE_HW_VIDEO_ENCODER == (usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) )
+				|| (MALI_GRALLOC_USAGE_NO_AFBC == (usage & MALI_GRALLOC_USAGE_NO_AFBC) )
+				|| (0 != (usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK) ) )
+				|| (GRALLOC_USAGE_HW_CAMERA_WRITE == (usage & GRALLOC_USAGE_HW_CAMERA_WRITE) )
+				|| (GRALLOC_USAGE_HW_CAMERA_READ == (usage & GRALLOC_USAGE_HW_CAMERA_READ) )
+				|| (internal_format == MALI_GRALLOC_FORMAT_INTERNAL_NV12)
+				|| (internal_format == MALI_GRALLOC_FORMAT_INTERNAL_P010)
+				|| (internal_format == MALI_GRALLOC_FORMAT_INTERNAL_RGBA_16161616)
+				|| (internal_format == MALI_GRALLOC_FORMAT_INTERNAL_NV16) )
 			{
-			case RK3326:
-				I("to allocate AFBC buffer for fb_target_layer on rk3326.");
-				internal_format = 
-					MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
-					| MALI_GRALLOC_INTFMT_AFBC_BASIC
-					| MALI_GRALLOC_INTFMT_AFBC_YUV_TRANSFORM;
-				break;
-
-			case RK356X:
-				I("to allocate AFBC buffer for fb_target_layer on rk356x.");
-				internal_format = 
-					MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
-					| MALI_GRALLOC_INTFMT_AFBC_BASIC;
-				break;
-
-			default:
-				LOG_ALWAYS_FATAL("unexpected 'platform' : %d", platform);
-				break;
+				D("not to use AFBC for buffer_of_fb_target_layer with usage('0x%" PRIx64 "') and  internal_format('0x%" PRIx64 "').",
+				  usage,
+				  internal_format);
 			}
+			/* 否则, ... */
+			else
+			{
+				rk_board_platform_t platform = get_rk_board_platform();
+				switch ( platform )
+				{
+				case RK3326:
+					I("to allocate AFBC buffer for fb_target_layer on rk3326.");
+					internal_format = 
+						MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
+						| MALI_GRALLOC_INTFMT_AFBC_BASIC
+						| MALI_GRALLOC_INTFMT_AFBC_YUV_TRANSFORM;
+					break;
 
-			property_set("vendor.gmali.fbdc_target", "1"); // 继续遵循 rk_drm_gralloc 和 rk_drm_hwc 的约定.
+				case RK356X:
+					if ( 0 == (usage & MALI_GRALLOC_USAGE_NO_AFBC) )
+					{
+					    D("to allocate AFBC buffer for fb_target_layer on rk356x.");
+					    internal_format = 
+						    MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888
+						    | MALI_GRALLOC_INTFMT_AFBC_BASIC;
+					}
+					else
+					{
+					    D("to allocate non AFBC buffer for fb_target_layer on rk356x.");
+					    internal_format = MALI_GRALLOC_FORMAT_INTERNAL_RGBA_8888;
+					}
+					break;
+
+				default:
+					LOG_ALWAYS_FATAL("unexpected 'platform' : %d", platform);
+					break;
+				}
+			}
 		}
 		else	// if ( !should_disable_afbc_in_fb_target_layer() )
 		{
@@ -1838,11 +1863,15 @@ static uint64_t rk_gralloc_select_format(const uint64_t req_format,
 
 		return internal_format;
 	}
-	/* 否则, 即 当前 buffer 用于 sf_client_layer, 则... */
+	/* 否则, 即 当前 buffer 用于 sf_client_layer 等其他用途, 则... */
 	else
 	{
-                /* 若 client "没有" 在 'usage' 显式要求 "不" 使用 AFBC, 则 ... */
-                if ( 0 == (usage & MALI_GRALLOC_USAGE_NO_AFBC) )
+                /* 若 client "没有" 在 'usage' 显式要求 "不" 使用 AFBC,
+		 *	且 外部 "没有" '通过属性要求 对 sf_client_layer "不" 使用 AFBC 格式',
+		 * 则 将尝试使用 AFBC 格式, ...
+		 */
+                if ( 0 == (usage & MALI_GRALLOC_USAGE_NO_AFBC)
+			&& !(is_no_afbc_for_sf_client_layer_required_via_prop() ) )
                 {
                         /* 若当前 platform 是 356x, 则... */
                         if ( RK356X == get_rk_board_platform() )
